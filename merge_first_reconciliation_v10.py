@@ -1,4 +1,4 @@
-# merge_first_reconciliation_v10.py
+# merge_first_reconciliation_v11.py
 # ================================================================
 # MERGE-FIRST KYC RECONCILIATION
 # ================================================================
@@ -113,14 +113,20 @@ def amount_equal(a, b, tolerance=AMOUNT_TOLERANCE):
         return False
 
 
-def parse_datetime(series, utc=False):
+def parse_datetime(series, utc=False, dayfirst=True):
+    """Parse source dates without swapping ISO YYYY-MM-DD month/day values.
+
+    VPS uses timezone-aware ISO timestamps and is handled with utc=True.
+    Paymeter uses ISO YYYY-MM-DD HH:MM:SS and must use dayfirst=False.
+    Bank/Macron use DD/MM/YYYY and use the default dayfirst=True.
+    """
     if utc:
         d = pd.to_datetime(series, errors="coerce", utc=True)
         try:
             return d.dt.tz_convert("Africa/Lagos").dt.tz_localize(None)
         except Exception:
             return d.dt.tz_localize(None)
-    return pd.to_datetime(series, errors="coerce", dayfirst=True)
+    return pd.to_datetime(series, errors="coerce", dayfirst=dayfirst)
 
 
 def unique_join(values):
@@ -328,7 +334,8 @@ def clean_paymeter(file_obj):
     for c in ["Transaction ID", "Account Number", "Meter Number", "RRN", "Reference"]:
         df[c] = df[c].map(clean_id)
 
-    df["PM_DateTime"] = parse_datetime(df["Created At"])
+    # Paymeter exports ISO dates (YYYY-MM-DD), so dayfirst must be False.
+    df["PM_DateTime"] = parse_datetime(df["Created At"], dayfirst=False)
     df["PM_Date"] = df["PM_DateTime"].dt.normalize()
     df["PM_Row"] = np.arange(len(df))
     df.attrs["ignored_blank_header_columns"] = ignored_header
@@ -1020,33 +1027,568 @@ def validate_tieout(control):
 
 
 # ================================================================
-# MANAGEMENT / EXCEPTION REPORTS
+# MANAGEMENT REPORT / EXCEPTION ANALYSIS
 # ================================================================
 
-def build_management(final_recon, kyc, pay, control):
+def _num_sum(series):
+    return pd.to_numeric(series, errors="coerce").sum()
+
+
+def _pct(numerator, denominator):
+    if denominator in (0, None) or pd.isna(denominator):
+        return 0.0
+    return (float(numerator) / float(denominator)) * 100.0
+
+
+def _period_bounds(df, datetime_col, filter_mask=None):
+    if datetime_col not in df.columns:
+        return None, None
+    s = pd.to_datetime(df[datetime_col], errors="coerce")
+    if filter_mask is not None:
+        s = s[filter_mask]
+    s = s.dropna()
+    if s.empty:
+        return None, None
+    return s.min(), s.max()
+
+
+def _fmt_period(value):
+    if value is None or pd.isna(value):
+        return ""
+    return pd.Timestamp(value).strftime("%d-%b-%Y")
+
+
+def build_management_report(
+    bank,
+    vps,
+    pay,
+    mac,
+    pm_mac_merge,
+    vps_bank_merge,
+    kyc,
+    final_recon,
+    vps_macron,
+    customer_summary,
+    summary_control,
+    source_coverage,
+):
+    """
+    Comprehensive management report covering:
+      * source/reporting periods and volumes;
+      * source financial totals;
+      * Paymeter↔Macron and VPS↔Bank merge performance;
+      * end-to-end reconciliation and amount alignment;
+      * VPS↔Macron fulfilment/value accuracy;
+      * KYC coverage;
+      * operational/financial exceptions;
+      * Paymeter/data-quality controls;
+      * Customer Summary tie-out and source coverage.
+
+    The report is deliberately long-form: one KPI per row with an explanation,
+    calculation/source and management attention note.
+    """
+    rows = []
+
+    def add(section, parameter, value, unit="", status="INFO", interpretation="", calculation="", attention=""):
+        rows.append({
+            "Section": section,
+            "Parameter": parameter,
+            "Value": value,
+            "Unit": unit,
+            "Status": status,
+            "Interpretation": interpretation,
+            "Calculation / Source": calculation,
+            "Management Attention / Action": attention,
+        })
+
+    # ------------------------------------------------------------
+    # REPORTING PERIOD / SOURCE COVERAGE DATES
+    # ------------------------------------------------------------
+    bank_credit_mask = bank["Credit"].notna()
+    b_start, b_end = _period_bounds(bank, "BANK_DateTime", bank_credit_mask)
+    v_start, v_end = _period_bounds(vps, "VPS_DateTime")
+    p_start, p_end = _period_bounds(pay, "PM_DateTime")
+    m_start, m_end = _period_bounds(mac, "MAC_DateTime")
+
+    periods = {
+        "Bank Credits": (b_start, b_end),
+        "VPS": (v_start, v_end),
+        "Paymeter": (p_start, p_end),
+        "Macron": (m_start, m_end),
+    }
+    valid_ends = [e for _, e in periods.values() if e is not None and not pd.isna(e)]
+    common_end = min(valid_ends) if valid_ends else None
+    end_dates = {_fmt_period(e) for _, e in periods.values() if e is not None and not pd.isna(e)}
+
+    for source, (start_dt, end_dt) in periods.items():
+        add(
+            "01 Reporting Period",
+            f"{source} period",
+            f"{_fmt_period(start_dt)} to {_fmt_period(end_dt)}" if start_dt is not None else "Not available",
+            "date range",
+            "INFO",
+            f"Transaction date coverage detected in the {source} source.",
+            f"Minimum and maximum parsed transaction dates in {source}.",
+        )
+
+    add(
+        "01 Reporting Period",
+        "Latest common date across all four sources",
+        _fmt_period(common_end),
+        "date",
+        "INFO",
+        "Latest date up to which all four reports have data coverage.",
+        "Minimum of the four source ending dates.",
+        "Use this date for strict like-for-like period analysis when source reports end on different dates.",
+    )
+    add(
+        "01 Reporting Period",
+        "Source ending dates aligned",
+        "YES" if len(end_dates) <= 1 else "NO",
+        "control",
+        "GOOD" if len(end_dates) <= 1 else "ATTENTION",
+        "Shows whether all four source reports end on the same calendar date.",
+        "Comparison of Bank, VPS, Paymeter and Macron maximum transaction dates.",
+        "If NO, some unmatched transactions may be timing/coverage exceptions rather than processing failures.",
+    )
+
+    # ------------------------------------------------------------
+    # SOURCE VOLUMES / FINANCIAL TOTALS
+    # ------------------------------------------------------------
+    bank_count = int(bank_credit_mask.sum())
+    bank_total = _num_sum(bank.loc[bank_credit_mask, "Credit"])
+    vps_count = len(vps)
+    vps_gross = _num_sum(vps["transaction_amount_minor"])
+    vps_settled = _num_sum(vps["settled_amount_minor"])
+    vps_charges = _num_sum(vps["charge_amount_minor"])
+    valid_vps_amount_count = int(pd.to_numeric(vps["transaction_amount_minor"], errors="coerce").notna().sum())
+    expected_macron_total = vps_gross - (MACRON_TOKEN_CHARGE * valid_vps_amount_count)
+    pay_count = len(pay)
+    pay_input = _num_sum(pay["Input Amount"])
+    pay_charge = _num_sum(pay["System Charge"])
+    pay_token = _num_sum(pay["Transaction Amount"])
+    mac_count = len(mac)
+    mac_amount = _num_sum(mac["AMOUNT"])
+
+    source_kpis = [
+        ("Bank credit transactions", bank_count, "count", "Number of credit rows in Providus Bank."),
+        ("Total Bank credits", bank_total, "amount", "Sum of Bank Credit rows."),
+        ("VPS transactions", vps_count, "count", "Number of VPS transactions."),
+        ("Total customer amount paid on VPS", vps_gross, "amount", "Sum of VPS transaction_amount_minor."),
+        ("Total VPS settled amount", vps_settled, "amount", "Sum of VPS settled_amount_minor."),
+        ("Total VPS charges", vps_charges, "amount", "Sum of VPS charge_amount_minor."),
+        ("Expected Macron token from VPS", expected_macron_total, "amount", "Σ(transaction_amount_minor - ₦100) for VPS rows with an amount."),
+        ("Paymeter transactions", pay_count, "count", "Number of cleaned Paymeter rows."),
+        ("Total Paymeter input amount", pay_input, "amount", "Sum of cleaned Paymeter Input Amount."),
+        ("Total Paymeter system charges", pay_charge, "amount", "Sum of cleaned Paymeter System Charge."),
+        ("Total Paymeter token/net amount", pay_token, "amount", "Sum of cleaned Paymeter Transaction Amount."),
+        ("Macron vend transactions", mac_count, "count", "Number of Macron rows."),
+        ("Total Macron token amount", mac_amount, "amount", "Sum of Macron AMOUNT."),
+    ]
+    for parameter, value, unit, calc in source_kpis:
+        add("02 Source Volume & Financial Totals", parameter, value, unit, "INFO", calc, calc)
+
+    add(
+        "02 Source Volume & Financial Totals",
+        "VPS gross less VPS settled",
+        vps_gross - vps_settled,
+        "amount",
+        "INFO",
+        "Aggregate difference between customer amount paid on VPS and VPS settled amount.",
+        "Total VPS transaction_amount_minor - Total VPS settled_amount_minor.",
+    )
+    add(
+        "02 Source Volume & Financial Totals",
+        "Paymeter input less Paymeter token/net",
+        pay_input - pay_token,
+        "amount",
+        "INFO",
+        "Aggregate reduction between Paymeter gross input and Paymeter token/net value.",
+        "Total Paymeter Input Amount - Total Paymeter Transaction Amount.",
+    )
+
+    # ------------------------------------------------------------
+    # FIRST MERGE: PAYMETER ↔ MACRON
+    # ------------------------------------------------------------
+    pm_status = pm_mac_merge["PMMAC_Match_Status"].value_counts()
+    pm_matched = int(pm_status.get("MATCHED", 0))
+    pm_only = int(pm_status.get("PAYMETER ONLY - NO MACRON", 0))
+    mac_only_pm = int(pm_status.get("MACRON ONLY - NO PAYMETER", 0))
+    pm_match_rate = _pct(pm_matched, pay_count)
+    mac_pm_match_rate = _pct(pm_matched, mac_count)
+
+    add("03 Paymeter ↔ Macron Merge", "Exact Paymeter-Macron matches", pm_matched, "count", "GOOD" if pm_only == 0 and mac_only_pm == 0 else "ATTENTION", "Transactions linked by exact reference.", "Paymeter Reference = Macron REFERENCE ID.")
+    add("03 Paymeter ↔ Macron Merge", "Paymeter matched to Macron rate", pm_match_rate, "percent", "GOOD" if pm_match_rate >= 99.99 else "ATTENTION", "Share of Paymeter transactions with a Macron counterpart.", "Exact matches / cleaned Paymeter rows × 100.")
+    add("03 Paymeter ↔ Macron Merge", "Macron matched to Paymeter rate", mac_pm_match_rate, "percent", "GOOD" if mac_pm_match_rate >= 99.99 else "ATTENTION", "Share of Macron vends with a Paymeter counterpart.", "Exact matches / Macron rows × 100.")
+    add("03 Paymeter ↔ Macron Merge", "Paymeter transactions with no Macron", pm_only, "count", "GOOD" if pm_only == 0 else "ATTENTION", "Paymeter-side transactions not found in Macron.", "PMMAC_Match_Status = PAYMETER ONLY - NO MACRON.", "Investigate whether token/vend was delayed, failed or outside the Macron report period.")
+    add("03 Paymeter ↔ Macron Merge", "Macron transactions with no Paymeter", mac_only_pm, "count", "GOOD" if mac_only_pm == 0 else "ATTENTION", "Macron-side transactions not found in Paymeter.", "PMMAC_Match_Status = MACRON ONLY - NO PAYMETER.", "Review for missing upstream transaction, report-period difference or reference-quality issue.")
+
+    pm_only_rows = pm_mac_merge[pm_mac_merge["PMMAC_Match_Status"] == "PAYMETER ONLY - NO MACRON"]
+    mac_only_rows = pm_mac_merge[pm_mac_merge["PMMAC_Match_Status"] == "MACRON ONLY - NO PAYMETER"]
+    add("03 Paymeter ↔ Macron Merge", "Paymeter token/net value with no Macron counterpart", _num_sum(pm_only_rows.get("PM_Transaction Amount", pd.Series(dtype=float))), "amount", "GOOD" if pm_only == 0 else "ATTENTION", "Token/net value recorded by Paymeter without a Macron match.", "Sum PM_Transaction Amount where Paymeter has no Macron.")
+    add("03 Paymeter ↔ Macron Merge", "Macron token value with no Paymeter counterpart", _num_sum(mac_only_rows.get("MAC_AMOUNT", pd.Series(dtype=float))), "amount", "GOOD" if mac_only_pm == 0 else "ATTENTION", "Macron token value without a Paymeter match.", "Sum MAC_AMOUNT where Macron has no Paymeter.")
+
+    # ------------------------------------------------------------
+    # SECOND MERGE: VPS ↔ BANK
+    # ------------------------------------------------------------
+    vb_status = vps_bank_merge["VPSBANK_Match_Status"].value_counts()
+    vb_matched = int(vb_status.get("MATCHED", 0))
+    vps_only_bank = int(vb_status.get("VPS ONLY - NO BANK", 0))
+    bank_only_vps = int(vb_status.get("BANK ONLY - NO VPS", 0))
+    exact_bank = int((vps_bank_merge["VPSBANK_Match_Method"] == "VPS session_id found in Bank Narration").sum())
+    fallback_bank = int((vps_bank_merge["VPSBANK_Match_Method"] == "Unique VPS settled amount + date").sum())
+
+    add("04 VPS ↔ Bank Merge", "VPS-Bank matched transactions", vb_matched, "count", "GOOD" if vps_only_bank == 0 and bank_only_vps == 0 else "ATTENTION", "Transactions linked between VPS and Bank.", "Exact narration/session match plus controlled unique amount/date fallback.")
+    add("04 VPS ↔ Bank Merge", "VPS matched to Bank rate", _pct(vb_matched, vps_count), "percent", "GOOD" if vps_only_bank == 0 else "ATTENTION", "Share of VPS rows with a Bank credit counterpart.", "VPS-Bank matched / VPS rows × 100.")
+    add("04 VPS ↔ Bank Merge", "Bank credits matched to VPS rate", _pct(vb_matched, bank_count), "percent", "GOOD" if bank_only_vps == 0 else "ATTENTION", "Share of Bank credits linked to VPS.", "VPS-Bank matched / Bank credit rows × 100.")
+    add("04 VPS ↔ Bank Merge", "Exact Bank matches using VPS session ID", exact_bank, "count", "INFO", "Strongest Bank↔VPS match method.", "VPS session_id found in Bank Narration.")
+    add("04 VPS ↔ Bank Merge", "Fallback Bank matches", fallback_bank, "count", "INFO", "Bank↔VPS matches made only when settled amount/date candidate was unique.", "Unique VPS settled amount + date.")
+    add("04 VPS ↔ Bank Merge", "VPS transactions with no Bank match", vps_only_bank, "count", "GOOD" if vps_only_bank == 0 else "ATTENTION", "VPS transactions for which no Bank credit was matched.", "VPSBANK_Match_Status = VPS ONLY - NO BANK.", "Review Bank report coverage, narration/session IDs and settlement timing.")
+    add("04 VPS ↔ Bank Merge", "Bank credits with no VPS match", bank_only_vps, "count", "GOOD" if bank_only_vps == 0 else "ATTENTION", "Bank credits not linked to VPS; these are not automatically assumed to be vending payments.", "VPSBANK_Match_Status = BANK ONLY - NO VPS.", "Investigate separately for unrelated receipts or missing VPS records.")
+    bank_only_rows = vps_bank_merge[vps_bank_merge["VPSBANK_Match_Status"] == "BANK ONLY - NO VPS"]
+    add("04 VPS ↔ Bank Merge", "Bank credit value with no VPS match", _num_sum(bank_only_rows.get("BANK_Credit", pd.Series(dtype=float))), "amount", "GOOD" if bank_only_vps == 0 else "ATTENTION", "Total unmatched Bank-credit value.", "Sum BANK_Credit where Bank has no VPS match.")
+
+    # ------------------------------------------------------------
+    # KYC COVERAGE
+    # ------------------------------------------------------------
+    kyc_total = len(kyc)
+    complete_kyc = int((kyc["KYC Status"] == "COMPLETE CORE KYC").sum())
+    incomplete_kyc = kyc_total - complete_kyc
+    conflict_kyc = int(kyc["KYC Conflict"].map(clean_id).ne("").sum()) if "KYC Conflict" in kyc.columns else 0
+    kyc_status_counts = final_recon["FINAL_KYC_Status"].value_counts()
+    no_kyc_rows = int(kyc_status_counts.get("NO KYC", 0))
+    one_side_kyc = int(kyc_status_counts.get("KYC ON ONE SIDE", 0))
+    aligned_kyc = int(kyc_status_counts.get("KYC ALIGNED", 0))
+    mismatch_kyc = int(kyc_status_counts.get("KYC MISMATCH", 0))
+
+    add("05 KYC Coverage", "KYC master customers / VPS virtual accounts", kyc_total, "people", "INFO", "One KYC record per unique VPS virtual account.", "KYC base population from VPS virtual_acct_no.")
+    add("05 KYC Coverage", "Complete core KYC", complete_kyc, "people", "GOOD" if incomplete_kyc == 0 else "ATTENTION", "KYC records with core customer, Paymeter and Macron identity populated.", "KYC Status = COMPLETE CORE KYC.")
+    add("05 KYC Coverage", "Complete core KYC rate", _pct(complete_kyc, kyc_total), "percent", "GOOD" if incomplete_kyc == 0 else "ATTENTION", "Percentage of the KYC master that is core-complete.", "Complete core KYC / KYC master × 100.")
+    add("05 KYC Coverage", "Incomplete KYC", incomplete_kyc, "people", "GOOD" if incomplete_kyc == 0 else "ATTENTION", "KYC records still missing one or more core identities.", "KYC Status != COMPLETE CORE KYC.", "Prioritise identity completion for repeated/high-value customers.")
+    add("05 KYC Coverage", "KYC records with conflict flags", conflict_kyc, "people", "GOOD" if conflict_kyc == 0 else "ATTENTION", "KYC records where multiple identity values may need review.", "Non-blank KYC Conflict.")
+    add("05 KYC Coverage", "Full-reconciliation rows with aligned KYC", aligned_kyc, "count", "INFO", "Rows where both merged sides carry the same KYC ID.", "FINAL_KYC_Status = KYC ALIGNED.")
+    add("05 KYC Coverage", "Full-reconciliation rows with KYC on one side", one_side_kyc, "count", "GOOD" if one_side_kyc == 0 else "ATTENTION", "Only one side of the transaction journey carries KYC.", "FINAL_KYC_Status = KYC ON ONE SIDE.")
+    add("05 KYC Coverage", "Full-reconciliation rows with no KYC", no_kyc_rows, "count", "GOOD" if no_kyc_rows == 0 else "ATTENTION", "Rows retained in reconciliation but not attributable to formal KYC.", "FINAL_KYC_Status = NO KYC.")
+    add("05 KYC Coverage", "Full-reconciliation KYC mismatches", mismatch_kyc, "count", "GOOD" if mismatch_kyc == 0 else "CRITICAL", "Rows where left and right KYC IDs disagree.", "FINAL_KYC_Status = KYC MISMATCH.", "Review identity mapping before relying on customer-level attribution.")
+
+    # ------------------------------------------------------------
+    # END-TO-END RECONCILIATION
+    # ------------------------------------------------------------
+    total_final = len(final_recon)
+    final_status = final_recon["FINAL_Reconciliation_Status"].value_counts()
+    fully = int(final_status.get("FULLY RECONCILED", 0))
+    amount_status = final_recon["FINAL_Amount_Status"].value_counts()
+    aligned_amount = int(amount_status.get("AMOUNTS ALIGNED", 0))
+    amount_diff = int(amount_status.get("AMOUNT DIFFERENCE", 0))
+    not_comparable = int(amount_status.get("NOT COMPARABLE", 0))
+    exact_final = int((final_recon["FINAL_Match_Method"] == "VPS settlement_ref = Paymeter RRN").sum())
+    fallback_final = int((final_recon["FINAL_Match_Method"] == "KYC + amount + date fallback").sum())
+
+    add("06 End-to-End Reconciliation", "Full reconciliation journey rows", total_final, "count", "INFO", "All transaction journeys after the two merged reports are reconciled.", "Rows in 07 Full Reconciliation.")
+    add("06 End-to-End Reconciliation", "Fully reconciled rows", fully, "count", "GOOD" if fully == total_final else "ATTENTION", "Rows with Bank, VPS, Paymeter, Macron and aligned amounts.", "FINAL_Reconciliation_Status = FULLY RECONCILED.")
+    add("06 End-to-End Reconciliation", "Fully reconciled rate", _pct(fully, total_final), "percent", "GOOD" if fully == total_final else "ATTENTION", "Share of full journey rows that completely reconcile.", "Fully reconciled rows / final reconciliation rows × 100.")
+    add("06 End-to-End Reconciliation", "Exact VPS settlement_ref ↔ Paymeter RRN matches", exact_final, "count", "INFO", "Strongest bridge between the VPS-Bank and Paymeter-Macron merged reports.", "FINAL_Match_Method = VPS settlement_ref = Paymeter RRN.")
+    add("06 End-to-End Reconciliation", "KYC + amount + date fallback matches", fallback_final, "count", "INFO", "Controlled fallback matches when exact transactional bridge is unavailable.", "FINAL_Match_Method = KYC + amount + date fallback.")
+    add("06 End-to-End Reconciliation", "Rows with amounts aligned", aligned_amount, "count", "INFO", "Rows where all available financial comparisons agree within tolerance.", "FINAL_Amount_Status = AMOUNTS ALIGNED.")
+    add("06 End-to-End Reconciliation", "Rows with financial amount difference", amount_diff, "count", "GOOD" if amount_diff == 0 else "CRITICAL", "Rows with at least one financial comparison outside tolerance.", "FINAL_Amount_Status = AMOUNT DIFFERENCE.", "Review value differences before management sign-off.")
+    add("06 End-to-End Reconciliation", "Rows not financially comparable", not_comparable, "count", "GOOD" if not_comparable == 0 else "ATTENTION", "Rows missing one or more stages needed for amount comparison.", "FINAL_Amount_Status = NOT COMPARABLE.")
+
+    # Status-level exception counts
+    for status_name, count in final_status.items():
+        if status_name == "FULLY RECONCILED":
+            continue
+        add(
+            "06 End-to-End Reconciliation",
+            f"Status: {status_name}",
+            int(count),
+            "count",
+            "ATTENTION",
+            f"Number of final reconciliation rows classified as {status_name}.",
+            f"FINAL_Reconciliation_Status = {status_name}.",
+        )
+
+    # ------------------------------------------------------------
+    # VPS ↔ MACRON TOKEN FULFILMENT / VALUE
+    # ------------------------------------------------------------
+    vm_status = vps_macron["VPS_vs_Macron_Status"].value_counts()
+    value_match = int(vm_status.get("VALUE MATCH", 0))
+    value_difference = int(vm_status.get("VALUE DIFFERENCE", 0))
+    paid_no_token_count = int(vm_status.get("PAID / NO TOKEN", 0))
+    token_no_vps_count = int(vm_status.get("TOKEN / NO VPS PAYMENT", 0))
+    both_vps_mac = value_match + value_difference
+
     paid_no_token = final_recon[(final_recon["VPS Present?"] == "YES") & (final_recon["Macron Present?"] == "NO")]
     token_no_vps = final_recon[(final_recon["Macron Present?"] == "YES") & (final_recon["VPS Present?"] == "NO")]
-    missing_kyc = final_recon[final_recon["FINAL_KYC_ID"].map(clean_id).eq("")]
-    metrics = [
-        ("Full reconciliation rows", len(final_recon), "count"),
-        ("Fully reconciled rows", int((final_recon["FINAL_Reconciliation_Status"] == "FULLY RECONCILED").sum()), "count"),
-        ("KYC customers", len(kyc), "people"),
-        ("Rows with no KYC", len(missing_kyc), "count"),
-        ("VPS payments with no Macron token", len(paid_no_token), "count"),
-        ("Customers with VPS payment but no Macron token", paid_no_token["FINAL_KYC_ID"].replace("", np.nan).nunique(), "people"),
-        ("Customer amount paid on VPS but no token", pd.to_numeric(paid_no_token["VPS Customer Amount Paid"], errors="coerce").sum(), "amount"),
-        ("Expected token value not issued (VPS paid - 100)", pd.to_numeric(paid_no_token["Expected Macron Token (VPS Paid - 100)"], errors="coerce").sum(), "amount"),
-        ("Macron tokens with no VPS payment", len(token_no_vps), "count"),
-        ("Customers with Macron token but no VPS payment", token_no_vps["FINAL_KYC_ID"].replace("", np.nan).nunique(), "people"),
-        ("Macron token value with no VPS payment", pd.to_numeric(token_no_vps["Macron Token Amount"], errors="coerce").sum(), "amount"),
-        ("Paymeter rows cleaned", len(pay), "count"),
-        ("Paymeter rows with Address spill repaired", int(pay.attrs.get("repaired_rows", 0)), "count"),
-        ("Paymeter Address spill cells deleted", int(pay.attrs.get("spill_cells_deleted", 0)), "count"),
-        ("Customer Summary tie-out controls passed", int((control["Status"] == "MATCH").sum()), "count"),
-        ("Customer Summary tie-out controls failed", int((control["Status"] != "MATCH").sum()), "count"),
-    ]
-    return pd.DataFrame(metrics, columns=["Metric", "Value", "Unit"])
+    value_diff_rows = vps_macron[vps_macron["VPS_vs_Macron_Status"] == "VALUE DIFFERENCE"].copy()
+    value_diff_series = pd.to_numeric(value_diff_rows["Difference Expected Macron - Actual Macron"], errors="coerce")
 
+    add("07 VPS ↔ Macron Token Control", "Fixed Macron token charge per VPS payment", MACRON_TOKEN_CHARGE, "amount", "INFO", "Business rule used for every VPS→Macron comparison.", "Expected Macron Token = VPS transaction_amount_minor - ₦100.")
+    add("07 VPS ↔ Macron Token Control", "VPS payments with a Macron token present", both_vps_mac, "count", "GOOD" if paid_no_token_count == 0 else "ATTENTION", "VPS payments that have a Macron counterpart, regardless of value accuracy.", "VALUE MATCH + VALUE DIFFERENCE.")
+    add("07 VPS ↔ Macron Token Control", "Macron token presence rate for VPS payments", _pct(both_vps_mac, vps_count), "percent", "GOOD" if paid_no_token_count == 0 else "CRITICAL", "Share of VPS payments for which a Macron token/vend was found.", "VPS rows with Macron present / VPS transactions × 100.", "Paid/no-token cases require operational follow-up.")
+    add("07 VPS ↔ Macron Token Control", "VPS-Macron exact value matches", value_match, "count", "GOOD" if value_difference == 0 else "ATTENTION", "VPS payments where actual Macron amount equals VPS payment less ₦100.", "Difference Expected Macron - Actual Macron within tolerance.")
+    add("07 VPS ↔ Macron Token Control", "Value accuracy rate where both VPS and Macron exist", _pct(value_match, both_vps_mac), "percent", "GOOD" if value_difference == 0 else "ATTENTION", "Accuracy of token value among transactions where both VPS and Macron records exist.", "VALUE MATCH / (VALUE MATCH + VALUE DIFFERENCE) × 100.")
+    add("07 VPS ↔ Macron Token Control", "VPS-Macron value differences", value_difference, "count", "GOOD" if value_difference == 0 else "CRITICAL", "Transactions where Macron value differs from VPS paid less ₦100.", "VPS_vs_Macron_Status = VALUE DIFFERENCE.", "Investigate pricing/token issuance discrepancy.")
+    add("07 VPS ↔ Macron Token Control", "Absolute value variance on VPS-Macron differences", value_diff_series.abs().sum(), "amount", "GOOD" if value_difference == 0 else "CRITICAL", "Gross financial magnitude of VPS↔Macron value differences without netting positive and negative differences.", "Sum of absolute Difference Expected Macron - Actual Macron on VALUE DIFFERENCE rows.")
+    add("07 VPS ↔ Macron Token Control", "Net VPS-Macron value variance", value_diff_series.sum(), "amount", "GOOD" if value_difference == 0 else "ATTENTION", "Net difference across VPS↔Macron value-difference rows.", "Sum Difference Expected Macron - Actual Macron on VALUE DIFFERENCE rows.")
+    add("07 VPS ↔ Macron Token Control", "VPS payments with no Macron token", paid_no_token_count, "count", "GOOD" if paid_no_token_count == 0 else "CRITICAL", "Customer payments/VPS receipts for which no Macron token was found.", "VPS Present? = YES and Macron Present? = NO.", "Prioritise customer impact and outstanding token fulfilment.")
+    add("07 VPS ↔ Macron Token Control", "Customers with VPS payment but no token", int(paid_no_token["FINAL_KYC_ID"].replace("", np.nan).nunique()), "people", "GOOD" if paid_no_token_count == 0 else "CRITICAL", "Distinct mapped KYC customers affected by paid/no-token exceptions.", "Distinct non-blank FINAL_KYC_ID among paid/no-token rows.")
+    add("07 VPS ↔ Macron Token Control", "Customer amount paid on VPS with no Macron token", _num_sum(paid_no_token["VPS Customer Amount Paid"]), "amount", "GOOD" if paid_no_token_count == 0 else "CRITICAL", "Gross customer money represented by VPS paid/no-token rows.", "Sum VPS Customer Amount Paid where Macron is absent.")
+    add("07 VPS ↔ Macron Token Control", "Expected token value not issued", _num_sum(paid_no_token["Expected Macron Token (VPS Paid - 100)"]), "amount", "GOOD" if paid_no_token_count == 0 else "CRITICAL", "Token value that should have been issued after deducting ₦100 per VPS transaction.", "Sum Expected Macron Token on paid/no-token rows.")
+    add("07 VPS ↔ Macron Token Control", "Macron tokens with no VPS payment", token_no_vps_count, "count", "GOOD" if token_no_vps_count == 0 else "CRITICAL", "Macron vends for which no VPS payment exists in the reconciled population.", "Macron Present? = YES and VPS Present? = NO.", "Investigate potential unsupported vending, missing upstream payment or report-period timing.")
+    add("07 VPS ↔ Macron Token Control", "Customers with Macron token but no VPS payment", int(token_no_vps["FINAL_KYC_ID"].replace("", np.nan).nunique()), "people", "GOOD" if token_no_vps_count == 0 else "CRITICAL", "Distinct mapped KYC customers in token/no-VPS population.", "Distinct non-blank FINAL_KYC_ID among token/no-VPS rows.")
+    add("07 VPS ↔ Macron Token Control", "Macron token value with no VPS payment", _num_sum(token_no_vps["Macron Token Amount"]), "amount", "GOOD" if token_no_vps_count == 0 else "CRITICAL", "Actual Macron token value with no linked VPS payment.", "Sum Macron Token Amount where VPS is absent.")
+
+    # ------------------------------------------------------------
+    # CUSTOMER SUMMARY / SOURCE CONTROL
+    # ------------------------------------------------------------
+    unlinked_customers = int((customer_summary["Customer Classification"] != "KYC CUSTOMER").sum()) if "Customer Classification" in customer_summary.columns else 0
+    tie_pass = int((summary_control["Status"] == "MATCH").sum())
+    tie_fail = int((summary_control["Status"] != "MATCH").sum())
+    coverage_complete = int((source_coverage["Status"] == "COMPLETE").sum())
+    coverage_review = int((source_coverage["Status"] != "COMPLETE").sum())
+    missing_source_rows = int(pd.to_numeric(source_coverage["Missing Rows"], errors="coerce").fillna(0).sum())
+    duplicate_source_uses = int(pd.to_numeric(source_coverage["Duplicate Uses"], errors="coerce").fillna(0).sum())
+
+    add("08 Customer Summary & Control", "Customer Summary rows", len(customer_summary), "count", "INFO", "Formal KYC plus retained unlinked source identities.", "Rows in 09 Customer Summary.")
+    add("08 Customer Summary & Control", "Unlinked / non-KYC Customer Summary identities", unlinked_customers, "count", "GOOD" if unlinked_customers == 0 else "ATTENTION", "Synthetic identities retained so no source value disappears from the Customer Summary.", "Customer Classification != KYC CUSTOMER.")
+    add("08 Customer Summary & Control", "Customer Summary tie-out controls passed", tie_pass, "count", "GOOD" if tie_fail == 0 else "CRITICAL", "Source totals that exactly tie to Customer Summary.", "10 Summary Control Status = MATCH.")
+    add("08 Customer Summary & Control", "Customer Summary tie-out controls failed", tie_fail, "count", "GOOD" if tie_fail == 0 else "CRITICAL", "Any failure means Customer Summary does not fully account for a source total.", "10 Summary Control Status != MATCH.", "Workbook should not be signed off if any control fails.")
+    add("08 Customer Summary & Control", "Source coverage controls complete", coverage_complete, "count", "GOOD" if coverage_review == 0 else "CRITICAL", "Source populations represented exactly once in final reconciliation.", "15 Source Coverage Status = COMPLETE.")
+    add("08 Customer Summary & Control", "Source coverage controls requiring review", coverage_review, "count", "GOOD" if coverage_review == 0 else "CRITICAL", "Number of sources with missing or duplicate row usage.", "15 Source Coverage Status != COMPLETE.")
+    add("08 Customer Summary & Control", "Total missing source rows", missing_source_rows, "count", "GOOD" if missing_source_rows == 0 else "CRITICAL", "Source rows not represented in final reconciliation.", "Sum Missing Rows in Source Coverage.")
+    add("08 Customer Summary & Control", "Total duplicate source uses", duplicate_source_uses, "count", "GOOD" if duplicate_source_uses == 0 else "CRITICAL", "Source rows represented more than once in final reconciliation.", "Sum Duplicate Uses in Source Coverage.")
+
+    # ------------------------------------------------------------
+    # PAYMETER / SOURCE DATA QUALITY
+    # ------------------------------------------------------------
+    repaired_rows = int(pay.attrs.get("repaired_rows", 0))
+    spill_cells = int(pay.attrs.get("spill_cells_deleted", 0))
+    ignored_headers = int(pay.attrs.get("ignored_blank_header_columns", 0))
+    pm_review = int(pay.get("PM_Cleaning_Status", pd.Series(dtype=object)).astype(str).str.contains("REVIEW", case=False, na=False).sum())
+
+    quality_metrics = [
+        ("Paymeter rows cleaned", len(pay), "count", "INFO", "All downstream Paymeter reconciliation uses this cleaned population."),
+        ("Paymeter rows with Address spill repaired", repaired_rows, "count", "GOOD" if repaired_rows == 0 else "INFO", "Rows where extra Address fragments were deleted and later fields shifted back."),
+        ("Paymeter Address spill cells deleted", spill_cells, "count", "INFO", "Total extra Address cells removed."),
+        ("Blank Paymeter header columns ignored", ignored_headers, "count", "INFO", "Trailing blank export columns ignored after Status Checked."),
+        ("Paymeter rows requiring cleaning review", pm_review, "count", "GOOD" if pm_review == 0 else "ATTENTION", "Rows not confidently restored by structural cleaning."),
+        ("Paymeter rows missing Account Number", int(pay["Account Number"].map(clean_id).eq("").sum()), "count", "GOOD", "Missing Paymeter account identity."),
+        ("Paymeter rows missing Meter Number", int(pay["Meter Number"].map(clean_id).eq("").sum()), "count", "GOOD", "Missing Paymeter meter identity."),
+        ("Paymeter rows missing RRN", int(pay["RRN"].map(clean_id).eq("").sum()), "count", "GOOD", "Missing primary VPS↔Paymeter reference."),
+        ("Paymeter rows missing Reference", int(pay["Reference"].map(clean_id).eq("").sum()), "count", "GOOD", "Missing primary Paymeter↔Macron reference."),
+        ("VPS rows missing virtual account", int(vps["virtual_acct_no"].map(clean_id).eq("").sum()), "count", "GOOD", "Missing KYC base key."),
+        ("VPS rows missing settlement_ref", int(vps["settlement_ref"].map(clean_id).eq("").sum()), "count", "GOOD", "Missing primary VPS↔Paymeter key."),
+        ("VPS rows missing session_id", int(vps["session_id"].map(clean_id).eq("").sum()), "count", "GOOD", "Missing primary Bank↔VPS key."),
+        ("Macron rows missing Account Number", int(mac["ACCOUNT NUMBER"].map(clean_id).eq("").sum()), "count", "GOOD", "Missing Macron account identity."),
+        ("Macron rows missing Meter Number", int(mac["METER NUMBER"].map(clean_id).eq("").sum()), "count", "GOOD", "Missing Macron meter identity."),
+        ("Macron rows missing Reference ID", int(mac["REFERENCE ID"].map(clean_id).eq("").sum()), "count", "GOOD", "Missing primary Paymeter↔Macron key."),
+        ("Bank credit rows missing narration", int(bank.loc[bank_credit_mask, "Narration"].map(clean_id).eq("").sum()), "count", "GOOD", "Missing narration can prevent exact VPS session matching."),
+    ]
+    for parameter, value, unit, default_status, interpretation in quality_metrics:
+        status = default_status
+        if parameter.startswith(("Paymeter rows missing", "VPS rows missing", "Macron rows missing", "Bank credit rows missing")):
+            status = "GOOD" if int(value) == 0 else "ATTENTION"
+        add("09 Data Quality", parameter, value, unit, status, interpretation, parameter)
+
+    # ------------------------------------------------------------
+    # OVERALL CONTROL RESULT
+    # ------------------------------------------------------------
+    critical_count = sum(1 for r in rows if r["Status"] == "CRITICAL")
+    attention_count = sum(1 for r in rows if r["Status"] == "ATTENTION")
+    add(
+        "10 Overall Control",
+        "Critical management indicators",
+        critical_count,
+        "count",
+        "GOOD" if critical_count == 0 else "CRITICAL",
+        "Number of management KPIs currently marked CRITICAL.",
+        "Count of management report rows with Status = CRITICAL.",
+        "Review all CRITICAL items before final management sign-off.",
+    )
+    add(
+        "10 Overall Control",
+        "Attention indicators",
+        attention_count,
+        "count",
+        "GOOD" if attention_count == 0 else "ATTENTION",
+        "Number of management KPIs marked ATTENTION.",
+        "Count of management report rows with Status = ATTENTION.",
+    )
+    add(
+        "10 Overall Control",
+        "Management report conclusion",
+        "EXCEPTIONS REQUIRE REVIEW" if critical_count or attention_count else "ALL CONTROLS CLEAR",
+        "status",
+        "CRITICAL" if critical_count else ("ATTENTION" if attention_count else "GOOD"),
+        "High-level conclusion based on reconciliation, KYC, exception, tie-out and data-quality controls.",
+        "Derived from management KPI statuses.",
+    )
+
+    return pd.DataFrame(rows)
+
+
+def build_management_breakdown(final_recon, pm_mac_merge, vps_bank_merge, vps_macron):
+    """Structured count/value breakdown for management drill-down."""
+    rows = []
+
+    def add_group(dimension, series, df, vps_col=None, expected_col=None, mac_col=None, bank_col=None):
+        total = len(df)
+        for category, idx in series.groupby(series).groups.items():
+            g = df.loc[idx]
+            rows.append({
+                "Dimension": dimension,
+                "Category": clean_id(category) or "BLANK",
+                "Count": len(g),
+                "Rate %": _pct(len(g), total),
+                "VPS Customer Amount Paid": _num_sum(g[vps_col]) if vps_col and vps_col in g.columns else np.nan,
+                "Expected Macron Token": _num_sum(g[expected_col]) if expected_col and expected_col in g.columns else np.nan,
+                "Macron Token Amount": _num_sum(g[mac_col]) if mac_col and mac_col in g.columns else np.nan,
+                "Bank Credit": _num_sum(g[bank_col]) if bank_col and bank_col in g.columns else np.nan,
+            })
+
+    add_group(
+        "Final Reconciliation Status",
+        final_recon["FINAL_Reconciliation_Status"],
+        final_recon,
+        "VPS Customer Amount Paid",
+        "Expected Macron Token (VPS Paid - 100)",
+        "Macron Token Amount",
+        "Bank Credit",
+    )
+    add_group(
+        "Final Amount Status",
+        final_recon["FINAL_Amount_Status"],
+        final_recon,
+        "VPS Customer Amount Paid",
+        "Expected Macron Token (VPS Paid - 100)",
+        "Macron Token Amount",
+        "Bank Credit",
+    )
+    add_group(
+        "Final KYC Status",
+        final_recon["FINAL_KYC_Status"],
+        final_recon,
+        "VPS Customer Amount Paid",
+        "Expected Macron Token (VPS Paid - 100)",
+        "Macron Token Amount",
+        "Bank Credit",
+    )
+    add_group("Paymeter-Macron Merge Status", pm_mac_merge["PMMAC_Match_Status"], pm_mac_merge)
+    add_group("VPS-Bank Merge Status", vps_bank_merge["VPSBANK_Match_Status"], vps_bank_merge)
+    add_group(
+        "VPS-Macron Status",
+        vps_macron["VPS_vs_Macron_Status"],
+        vps_macron,
+        "VPS Customer Amount Paid",
+        "Expected Macron Token (VPS Paid - 100)",
+        "Macron Token Amount",
+    )
+    return pd.DataFrame(rows)
+
+
+def build_management_exception_register(final_recon):
+    """Management-focused register of all non-fully-reconciled transaction journeys."""
+    exceptions = final_recon[final_recon["FINAL_Reconciliation_Status"] != "FULLY RECONCILED"].copy()
+    if exceptions.empty:
+        return pd.DataFrame(columns=[
+            "Priority", "Exception Type", "FINAL_Row_ID", "FINAL_KYC_ID",
+            "FINAL_Customer_Name", "VPS Virtual Account", "Paymeter Account",
+            "Macron Account", "VPS Customer Amount Paid", "Expected Macron Token",
+            "Macron Token Amount", "Financial Exposure / Variance", "Bank Credit",
+            "VPS Settlement Ref", "Paymeter RRN", "Paymeter Reference",
+            "Macron Reference ID", "KYC Status", "Amount Status", "Match Method",
+        ])
+
+    def priority(r):
+        s = clean_id(r.get("FINAL_Reconciliation_Status"))
+        if s in {
+            "CUSTOMER PAID / VPS RECEIVED - NO MACRON TOKEN",
+            "MACRON TOKEN - NO VPS PAYMENT",
+            "VPS / MACRON VALUE DIFFERENCE",
+            "KYC MISMATCH",
+        }:
+            return "CRITICAL"
+        return "ATTENTION"
+
+    def exposure(r):
+        s = clean_id(r.get("FINAL_Reconciliation_Status"))
+        if s == "CUSTOMER PAID / VPS RECEIVED - NO MACRON TOKEN":
+            return abs(float(r.get("Expected Macron Token (VPS Paid - 100)"))) if pd.notna(r.get("Expected Macron Token (VPS Paid - 100)")) else 0.0
+        if s == "MACRON TOKEN - NO VPS PAYMENT":
+            return abs(float(r.get("Macron Token Amount"))) if pd.notna(r.get("Macron Token Amount")) else 0.0
+        if pd.notna(r.get("Difference Expected Macron - Actual Macron")):
+            return abs(float(r.get("Difference Expected Macron - Actual Macron")))
+        if pd.notna(r.get("Difference Bank Credit - VPS Settled")):
+            return abs(float(r.get("Difference Bank Credit - VPS Settled")))
+        if pd.notna(r.get("Difference VPS Paid - Paymeter Input")):
+            return abs(float(r.get("Difference VPS Paid - Paymeter Input")))
+        return 0.0
+
+    out = pd.DataFrame({
+        "Priority": exceptions.apply(priority, axis=1),
+        "Exception Type": exceptions["FINAL_Reconciliation_Status"],
+        "FINAL_Row_ID": exceptions["FINAL_Row_ID"],
+        "FINAL_KYC_ID": exceptions["FINAL_KYC_ID"],
+        "FINAL_Customer_Name": exceptions["FINAL_Customer_Name"],
+        "VPS Virtual Account": exceptions.get("LEFT_VPS_virtual_acct_no", ""),
+        "Paymeter Account": exceptions.get("RIGHT_PM_Account Number", ""),
+        "Macron Account": exceptions.get("RIGHT_MAC_ACCOUNT NUMBER", ""),
+        "VPS Customer Amount Paid": exceptions["VPS Customer Amount Paid"],
+        "Expected Macron Token": exceptions["Expected Macron Token (VPS Paid - 100)"],
+        "Macron Token Amount": exceptions["Macron Token Amount"],
+        "Financial Exposure / Variance": exceptions.apply(exposure, axis=1),
+        "Bank Credit": exceptions["Bank Credit"],
+        "VPS Settlement Ref": exceptions.get("LEFT_VPS_settlement_ref", ""),
+        "Paymeter RRN": exceptions.get("RIGHT_PM_RRN", ""),
+        "Paymeter Reference": exceptions.get("RIGHT_PM_Reference", ""),
+        "Macron Reference ID": exceptions.get("RIGHT_MAC_REFERENCE ID", ""),
+        "KYC Status": exceptions["FINAL_KYC_Status"],
+        "Amount Status": exceptions["FINAL_Amount_Status"],
+        "Match Method": exceptions["FINAL_Match_Method"],
+    })
+    order = pd.Categorical(out["Priority"], categories=["CRITICAL", "ATTENTION"], ordered=True)
+    out = out.assign(_priority_order=order).sort_values(
+        ["_priority_order", "Financial Exposure / Variance"],
+        ascending=[True, False],
+    ).drop(columns=["_priority_order"]).reset_index(drop=True)
+    return out
+
+
+def build_management_customer_risk(customer_summary):
+    """Customer-level exception/risk view for management follow-up."""
+    c = customer_summary.copy()
+    c["Absolute Expected-vs-Macron Difference"] = pd.to_numeric(
+        c["Difference Expected Macron - Actual Macron"], errors="coerce"
+    ).abs()
+    mask = (
+        (pd.to_numeric(c["VPS Paid / No Token Count"], errors="coerce").fillna(0) > 0)
+        | (pd.to_numeric(c["Token / No VPS Payment Count"], errors="coerce").fillna(0) > 0)
+        | (c["Absolute Expected-vs-Macron Difference"] > AMOUNT_TOLERANCE)
+        | (c["Customer Classification"] != "KYC CUSTOMER")
+    )
+    out = c[mask].copy()
+    out["Management Issue"] = out.apply(
+        lambda r: " | ".join([
+            x for x in [
+                "PAID / NO TOKEN" if float(pd.to_numeric(r.get("VPS Paid / No Token Count"), errors="coerce") or 0) > 0 else "",
+                "TOKEN / NO VPS" if float(pd.to_numeric(r.get("Token / No VPS Payment Count"), errors="coerce") or 0) > 0 else "",
+                "VALUE DIFFERENCE" if float(pd.to_numeric(r.get("Absolute Expected-vs-Macron Difference"), errors="coerce") or 0) > AMOUNT_TOLERANCE else "",
+                "UNLINKED IDENTITY" if clean_id(r.get("Customer Classification")) != "KYC CUSTOMER" else "",
+            ] if x
+        ]),
+        axis=1,
+    )
+    out = out.sort_values("Absolute Expected-vs-Macron Difference", ascending=False)
+    important = [
+        "Management Issue", "Summary Customer Key", "Customer Classification", "KYC_ID",
+        "Customer Name", "VPS Virtual Account Number", "Paymeter Account Number(s)",
+        "Macron Account Number(s)", "Total VPS Payment Count", "Total Macron Vend Count",
+        "VPS Paid / No Token Count", "Token / No VPS Payment Count",
+        "Total VPS Customer Amount Paid", "Expected Total Macron Token",
+        "Total Macron Token Amount", "Difference Expected Macron - Actual Macron",
+        "Absolute Expected-vs-Macron Difference", "KYC Status",
+    ]
+    return out[[c for c in important if c in out.columns]].reset_index(drop=True)
 
 def build_source_coverage(final_recon, bank, vps, pay, mac):
     checks = [
@@ -1088,7 +1630,10 @@ def build_column_guide(sheet_pairs):
         "08 VPS vs Macron": "Focused comparison of VPS customer payment against Macron token using KYC. Expected token = VPS transaction_amount_minor - 100.",
         "09 Customer Summary": "Complete customer/source summary. Unlinked source identities are retained so source totals do not disappear.",
         "10 Summary Control": "Hard tie-out proving Customer Summary totals equal respective source totals.",
-        "11 Reconciliation Summary": "Management exception and value summary.",
+        "11 Management Report": "Comprehensive management KPI report covering periods, source totals, merge rates, KYC, reconciliation, token controls, exceptions, tie-outs and data quality.",
+        "11A Mgmt Breakdown": "Management drill-down by final reconciliation, amount, KYC and stage-level match statuses.",
+        "11B Mgmt Exceptions": "Transaction-level register of all non-fully-reconciled journeys, prioritised by financial exposure.",
+        "11C Customer Risk": "Customer-level exception view showing paid/no-token, token/no-VPS, value differences and unlinked identities.",
         "12 Paid No Token": "VPS payment rows with no Macron token.",
         "13 Token No VPS": "Macron token rows with no VPS payment.",
         "14 Missing KYC": "Full-reconciliation rows where no KYC could be attached.",
@@ -1127,6 +1672,15 @@ def build_column_guide(sheet_pairs):
                 calc = "VPS source field, prefixed VPS_."
             elif col.startswith("BANK_"):
                 calc = "Bank source field, prefixed BANK_."
+            elif sheet == "11 Management Report" and col == "Value":
+                calc = "Calculated KPI value. See the Calculation / Source column on the same row for the exact formula/source."
+                meaning = "Management KPI result."
+            elif sheet == "11 Management Report" and col == "Status":
+                calc = "GOOD when control/exception is clear; ATTENTION when follow-up is needed; CRITICAL for material reconciliation/customer-impact exceptions; INFO for descriptive KPIs."
+                meaning = "Management attention classification."
+            elif sheet == "11B Mgmt Exceptions" and col == "Financial Exposure / Variance":
+                calc = "Paid/no-token: expected token value; token/no-VPS: actual Macron token value; value difference: absolute expected-vs-actual token difference; otherwise available financial difference."
+                meaning = "Financial magnitude used to prioritise the exception."
             rows.append({"Sheet": sheet, "Sheet Purpose": purpose.get(sheet, "Reconciliation output."), "Column Header": col, "Meaning": meaning, "How Calculated / Arrived At": calc})
     return pd.DataFrame(rows)
 
@@ -1148,7 +1702,10 @@ def make_excel(result):
         ("08 VPS vs Macron", result["vps_macron"]),
         ("09 Customer Summary", result["customer_summary"]),
         ("10 Summary Control", result["summary_control"]),
-        ("11 Reconciliation Summary", result["management"]),
+        ("11 Management Report", result["management_report"]),
+        ("11A Mgmt Breakdown", result["management_breakdown"]),
+        ("11B Mgmt Exceptions", result["management_exceptions"]),
+        ("11C Customer Risk", result["management_customer_risk"]),
         ("12 Paid No Token", result["paid_no_token"]),
         ("13 Token No VPS", result["token_no_vps"]),
         ("14 Missing KYC", result["missing_kyc"]),
@@ -1164,6 +1721,9 @@ def make_excel(result):
         fmt_wrap = wb.add_format({"text_wrap": True, "valign": "top"})
         fmt_good = wb.add_format({"bg_color": "#C6EFCE", "font_color": "#006100"})
         fmt_bad = wb.add_format({"bg_color": "#FFC7CE", "font_color": "#9C0006"})
+        fmt_warn = wb.add_format({"bg_color": "#FFF2CC", "font_color": "#7F6000"})
+        fmt_info = wb.add_format({"bg_color": "#D9EAF7", "font_color": "#1F4E78"})
+        fmt_percent = wb.add_format({"num_format": '0.00'})
 
         for name, df in sheets:
             safe = df.drop(columns=[c for c in df.columns if c.endswith("_Date") or c.endswith("_DateTime")], errors="ignore").copy()
@@ -1189,6 +1749,32 @@ def make_excel(result):
                     ws.conditional_format(1, j, len(safe), j, {"type": "text", "criteria": "containing", "value": "MATCH", "format": fmt_good})
                     ws.conditional_format(1, j, len(safe), j, {"type": "text", "criteria": "containing", "value": "NO ", "format": fmt_bad})
                     ws.conditional_format(1, j, len(safe), j, {"type": "text", "criteria": "containing", "value": "DIFFERENCE", "format": fmt_bad})
+
+            # Management-specific presentation.
+            if name == "11 Management Report" and len(safe):
+                for c, w in {
+                    "Section": 30,
+                    "Parameter": 48,
+                    "Value": 22,
+                    "Unit": 14,
+                    "Status": 14,
+                    "Interpretation": 58,
+                    "Calculation / Source": 58,
+                    "Management Attention / Action": 58,
+                }.items():
+                    if c in safe.columns:
+                        ws.set_column(safe.columns.get_loc(c), safe.columns.get_loc(c), w, fmt_wrap if c not in {"Value", "Unit", "Status"} else None)
+                if "Status" in safe.columns:
+                    sj = safe.columns.get_loc("Status")
+                    ws.conditional_format(1, sj, len(safe), sj, {"type": "text", "criteria": "containing", "value": "GOOD", "format": fmt_good})
+                    ws.conditional_format(1, sj, len(safe), sj, {"type": "text", "criteria": "containing", "value": "ATTENTION", "format": fmt_warn})
+                    ws.conditional_format(1, sj, len(safe), sj, {"type": "text", "criteria": "containing", "value": "CRITICAL", "format": fmt_bad})
+                    ws.conditional_format(1, sj, len(safe), sj, {"type": "text", "criteria": "containing", "value": "INFO", "format": fmt_info})
+
+            if name == "11B Mgmt Exceptions" and len(safe) and "Priority" in safe.columns:
+                pj = safe.columns.get_loc("Priority")
+                ws.conditional_format(1, pj, len(safe), pj, {"type": "text", "criteria": "containing", "value": "CRITICAL", "format": fmt_bad})
+                ws.conditional_format(1, pj, len(safe), pj, {"type": "text", "criteria": "containing", "value": "ATTENTION", "format": fmt_warn})
     output.seek(0)
     return output
 
@@ -1234,9 +1820,29 @@ def run_reconciliation(bank_file, vps_file, paymeter_file, macron_file, date_tol
     token_no_vps = final_recon[(final_recon["Macron Present?"] == "YES") & (final_recon["VPS Present?"] == "NO")].copy()
     missing_kyc = final_recon[final_recon["FINAL_KYC_ID"].map(clean_id).eq("")].copy()
     source_coverage = build_source_coverage(final_recon, bank, vps, pay, mac)
-    management = build_management(final_recon, kyc, pay, summary_control)
 
-    progress_call(progress, 100, "Reconciliation calculations complete.")
+    progress_call(progress, 95, "Building comprehensive management report and exception analysis...")
+    management_report = build_management_report(
+        bank=bank,
+        vps=vps,
+        pay=pay,
+        mac=mac,
+        pm_mac_merge=pm_mac,
+        vps_bank_merge=vps_bank,
+        kyc=kyc,
+        final_recon=final_recon,
+        vps_macron=vps_macron,
+        customer_summary=customer_summary,
+        summary_control=summary_control,
+        source_coverage=source_coverage,
+    )
+    management_breakdown = build_management_breakdown(
+        final_recon, pm_mac, vps_bank, vps_macron
+    )
+    management_exceptions = build_management_exception_register(final_recon)
+    management_customer_risk = build_management_customer_risk(customer_summary)
+
+    progress_call(progress, 100, "Reconciliation and management reporting complete.")
     return {
         "pay_cleaned": pay,
         "pm_mac_merge": pm_mac,
@@ -1248,7 +1854,12 @@ def run_reconciliation(bank_file, vps_file, paymeter_file, macron_file, date_tol
         "vps_macron": vps_macron,
         "customer_summary": customer_summary,
         "summary_control": summary_control,
-        "management": management,
+        "management_report": management_report,
+        "management_breakdown": management_breakdown,
+        "management_exceptions": management_exceptions,
+        "management_customer_risk": management_customer_risk,
+        # Backward-compatible alias used by older UI/code.
+        "management": management_report,
         "paid_no_token": paid_no_token,
         "token_no_vps": token_no_vps,
         "missing_kyc": missing_kyc,
@@ -1269,6 +1880,11 @@ def main():
     st.info(
         "This version follows the merge order exactly. Paymeter is cleaned first. "
         "Expected Macron token is always VPS transaction_amount_minor less ₦100."
+    )
+    st.info(
+        "The workbook now includes a comprehensive Management Report, status breakdown, "
+        "management exception register and customer-risk view covering all important "
+        "financial, reconciliation, KYC, data-quality and source-control parameters."
     )
 
     with st.sidebar:
@@ -1291,6 +1907,7 @@ def main():
 6. Attach KYC to the VPS-Bank merged report.
 7. Reconcile the two KYC-enriched merged reports.
 8. Compare VPS against Macron using KYC and **Expected Token = VPS transaction_amount_minor - ₦100**.
+9. Generate a comprehensive management report covering source totals, match rates, KYC, exceptions, financial exposure, data quality and tie-out controls.
 """)
         return
 
@@ -1310,20 +1927,46 @@ def main():
         excel = make_excel(result)
         stage.success("Excel workbook ready.")
 
-        st.subheader("Reconciliation Summary")
-        st.dataframe(result["management"], use_container_width=True, hide_index=True)
-        tabs = st.tabs(["Full Reconciliation", "KYC", "VPS vs Macron", "Customer Summary", "Summary Control", "Source Coverage"])
-        with tabs[0]: st.dataframe(result["final_recon"].head(1500), use_container_width=True, hide_index=True)
-        with tabs[1]: st.dataframe(result["kyc"].head(1500), use_container_width=True, hide_index=True)
-        with tabs[2]: st.dataframe(result["vps_macron"].head(1500), use_container_width=True, hide_index=True)
-        with tabs[3]: st.dataframe(result["customer_summary"].head(1500), use_container_width=True, hide_index=True)
-        with tabs[4]: st.dataframe(result["summary_control"], use_container_width=True, hide_index=True)
-        with tabs[5]: st.dataframe(result["source_coverage"], use_container_width=True, hide_index=True)
+        st.subheader("Management Dashboard")
+        mg = result["management_report"]
+
+        def mg_value(parameter, default=0):
+            hit = mg[mg["Parameter"] == parameter]
+            return hit.iloc[0]["Value"] if len(hit) else default
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Fully reconciled rate", f"{float(mg_value('Fully reconciled rate')):,.2f}%")
+        c2.metric("Complete KYC rate", f"{float(mg_value('Complete core KYC rate')):,.2f}%")
+        c3.metric("VPS token presence rate", f"{float(mg_value('Macron token presence rate for VPS payments')):,.2f}%")
+        c4.metric("Critical indicators", f"{int(float(mg_value('Critical management indicators'))):,}")
+
+        tabs = st.tabs([
+            "Management Report",
+            "Management Breakdown",
+            "Management Exceptions",
+            "Customer Risk",
+            "Full Reconciliation",
+            "KYC",
+            "VPS vs Macron",
+            "Customer Summary",
+            "Summary Control",
+            "Source Coverage",
+        ])
+        with tabs[0]: st.dataframe(result["management_report"], use_container_width=True, hide_index=True)
+        with tabs[1]: st.dataframe(result["management_breakdown"], use_container_width=True, hide_index=True)
+        with tabs[2]: st.dataframe(result["management_exceptions"].head(3000), use_container_width=True, hide_index=True)
+        with tabs[3]: st.dataframe(result["management_customer_risk"].head(2000), use_container_width=True, hide_index=True)
+        with tabs[4]: st.dataframe(result["final_recon"].head(1500), use_container_width=True, hide_index=True)
+        with tabs[5]: st.dataframe(result["kyc"].head(1500), use_container_width=True, hide_index=True)
+        with tabs[6]: st.dataframe(result["vps_macron"].head(1500), use_container_width=True, hide_index=True)
+        with tabs[7]: st.dataframe(result["customer_summary"].head(1500), use_container_width=True, hide_index=True)
+        with tabs[8]: st.dataframe(result["summary_control"], use_container_width=True, hide_index=True)
+        with tabs[9]: st.dataframe(result["source_coverage"], use_container_width=True, hide_index=True)
 
         st.download_button(
             "⬇️ DOWNLOAD RECONCILIATION WORKBOOK",
             data=excel,
-            file_name="Merge_First_KYC_Reconciliation_V10.xlsx",
+            file_name="Merge_First_KYC_Reconciliation_V11.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=True,
