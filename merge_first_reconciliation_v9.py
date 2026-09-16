@@ -1,4 +1,4 @@
-# merge_first_reconciliation_v9.py
+# merge_first_reconciliation_v10.py
 # ================================================================
 # MERGE-FIRST KYC RECONCILIATION
 # ================================================================
@@ -33,6 +33,21 @@ except Exception:
 AMOUNT_TOLERANCE = 0.01
 DATE_TOLERANCE_DAYS = 2
 MACRON_TOKEN_CHARGE = 100.00
+
+# ================================================================
+# OPTION 2 MANAGEMENT REPORT SETTINGS
+# ================================================================
+# Exposure classification is based on EACH customer's individual
+# share of the relevant total outstanding (recovery or token due).
+OPTION2_CRITICAL_SHARE = 0.10       # >= 10%
+OPTION2_HIGH_SHARE = 0.02           # 2% to <10%
+OPTION2_SIGNIFICANT_SHARE = 0.005   # 0.5% to <2%
+
+# Purchase-frequency bands are deliberately kept separate from
+# financial materiality. They describe customer activity only.
+OPTION2_VERY_FREQUENT_MIN = 13
+OPTION2_FREQUENT_MIN = 7
+OPTION2_REGULAR_MIN = 4
 
 PAYMETER_HEADER = [
     "Transaction ID", "Created At", "Updated Date", "Customer Name",
@@ -1008,6 +1023,480 @@ def validate_tieout(control):
 # MANAGEMENT / EXCEPTION REPORTS
 # ================================================================
 
+
+def _option2_frequency_rating(payment_count):
+    """
+    Customer purchase-frequency rating.
+
+    This is intentionally separate from the financial exposure rating:
+      Very Frequent = 13+ VPS purchases
+      Frequent      = 7-12
+      Regular       = 4-6
+      Occasional    = 1-3
+      No VPS History= 0
+    """
+    try:
+        count = int(float(payment_count))
+    except Exception:
+        count = 0
+
+    if count >= OPTION2_VERY_FREQUENT_MIN:
+        return "Very Frequent"
+    if count >= OPTION2_FREQUENT_MIN:
+        return "Frequent"
+    if count >= OPTION2_REGULAR_MIN:
+        return "Regular"
+    if count >= 1:
+        return "Occasional"
+    return "No VPS History"
+
+
+def _option2_exposure_category(share):
+    """
+    Option 2 financial-materiality rating based on the individual
+    customer's share of the RELEVANT total outstanding.
+
+      Critical         >= 10%
+      High Materiality  2% to <10%
+      Significant       0.5% to <2%
+      Low Materiality  < 0.5%
+    """
+    try:
+        share = float(share)
+    except Exception:
+        share = 0.0
+
+    if share >= OPTION2_CRITICAL_SHARE:
+        return "Critical"
+    if share >= OPTION2_HIGH_SHARE:
+        return "High Materiality"
+    if share >= OPTION2_SIGNIFICANT_SHARE:
+        return "Significant"
+    return "Low Materiality"
+
+
+def build_option2_management(customer_summary):
+    """
+    Build the Option 2 management report directly from Customer Summary.
+
+    Business logic:
+      Expected Token = Total VPS Customer Amount Paid
+                       - (Total VPS Payment Count * N100)
+
+      If Actual Macron Token > Expected Token:
+          Customer owes us the excess token value.
+
+      If Expected Token > Actual Macron Token:
+          We owe the customer token value.
+
+    Financial category is based on the customer's INDIVIDUAL SHARE of
+    the applicable total outstanding. Purchase frequency is a separate
+    behavioural rating and does not change the exposure category.
+    """
+    required = [
+        "Summary Customer Key",
+        "Customer Classification",
+        "Customer Name",
+        "Total VPS Payment Count",
+        "Total VPS Customer Amount Paid",
+        "Total Macron Token Amount",
+        "VPS Paid / No Token Count",
+        "Token / No VPS Payment Count",
+        "KYC Status",
+    ]
+    require_columns(customer_summary, required, "Customer Summary")
+
+    work = customer_summary.copy()
+
+    numeric_cols = [
+        "Total VPS Payment Count",
+        "Total VPS Customer Amount Paid",
+        "Total Macron Token Amount",
+        "VPS Paid / No Token Count",
+        "Token / No VPS Payment Count",
+    ]
+    for c in numeric_cols:
+        work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0)
+
+    # Recalculate expected token from the clarified business rule.
+    work["Option2 Expected Token Value"] = (
+        work["Total VPS Customer Amount Paid"]
+        - (work["Total VPS Payment Count"] * MACRON_TOKEN_CHARGE)
+    )
+    work["Option2 Actual Macron Token"] = work["Total Macron Token Amount"]
+
+    # Positive means too much token was issued; negative means token is still due.
+    work["Option2 Actual Less Expected"] = (
+        work["Option2 Actual Macron Token"]
+        - work["Option2 Expected Token Value"]
+    )
+
+    work["Option2 Recovery Outstanding"] = work["Option2 Actual Less Expected"].clip(lower=0)
+    work["Option2 Token Due"] = (-work["Option2 Actual Less Expected"]).clip(lower=0)
+
+    work["Direction"] = np.select(
+        [
+            work["Option2 Recovery Outstanding"] > AMOUNT_TOLERANCE,
+            work["Option2 Token Due"] > AMOUNT_TOLERANCE,
+        ],
+        [
+            "Customer Owes Us",
+            "We Owe Customer Token",
+        ],
+        default="Balanced",
+    )
+
+    # Only management exceptions belong in the Option 2 report.
+    out = work[work["Direction"] != "Balanced"].copy()
+
+    out["Outstanding Amount"] = np.where(
+        out["Direction"].eq("Customer Owes Us"),
+        out["Option2 Recovery Outstanding"],
+        out["Option2 Token Due"],
+    )
+
+    direction_totals = (
+        out.groupby("Direction")["Outstanding Amount"]
+        .sum()
+        .to_dict()
+    )
+
+    out["Relevant Total Outstanding"] = out["Direction"].map(direction_totals).fillna(0)
+    out["Individual Share of Total"] = np.where(
+        out["Relevant Total Outstanding"].abs() > AMOUNT_TOLERANCE,
+        out["Outstanding Amount"] / out["Relevant Total Outstanding"],
+        0.0,
+    )
+
+    out["Exposure Category"] = out["Individual Share of Total"].map(
+        _option2_exposure_category
+    )
+    out["Purchase Frequency Rating"] = out["Total VPS Payment Count"].map(
+        _option2_frequency_rating
+    )
+
+    # Rank separately on each side, highest outstanding first.
+    out["Rank"] = (
+        out.groupby("Direction")["Outstanding Amount"]
+        .rank(method="first", ascending=False)
+        .astype(int)
+    )
+
+    selected = [
+        "Direction",
+        "Rank",
+        "Summary Customer Key",
+        "Customer Name",
+        "Customer Classification",
+        "KYC Status",
+        "Total VPS Payment Count",
+        "Purchase Frequency Rating",
+        "VPS Paid / No Token Count",
+        "Token / No VPS Payment Count",
+        "Option2 Expected Token Value",
+        "Option2 Actual Macron Token",
+        "Outstanding Amount",
+        "Relevant Total Outstanding",
+        "Individual Share of Total",
+        "Exposure Category",
+    ]
+
+    out = out[selected].copy()
+    out = out.sort_values(
+        ["Direction", "Rank", "Customer Name"],
+        ascending=[True, True, True],
+    ).reset_index(drop=True)
+    return out
+
+
+def _option2_category_summary(option2_detail, direction):
+    """Return category counts, amount and share for one Option 2 direction."""
+    categories = ["Critical", "High Materiality", "Significant", "Low Materiality"]
+    subset = option2_detail[option2_detail["Direction"] == direction].copy()
+    total = pd.to_numeric(subset["Outstanding Amount"], errors="coerce").fillna(0).sum()
+
+    rows = []
+    for category in categories:
+        part = subset[subset["Exposure Category"] == category]
+        amount = pd.to_numeric(part["Outstanding Amount"], errors="coerce").fillna(0).sum()
+        rows.append({
+            "Exposure Category": category,
+            "Customers": len(part),
+            "Outstanding Amount": float(amount),
+            "% of Direction Total": float(amount / total) if total else 0.0,
+        })
+    return pd.DataFrame(rows)
+
+
+def _write_option2_management_sheet(writer, option2_detail):
+    """
+    Write a management-friendly Option 2 worksheet.
+
+    The top of the tab is a simple management report.
+    The full customer supporting detail is retained below it.
+    """
+    sheet_name = "16 Option 2 Management"
+    wb = writer.book
+    ws = wb.add_worksheet(sheet_name)
+    writer.sheets[sheet_name] = ws
+
+    # -------------------------
+    # Formats
+    # -------------------------
+    fmt_title = wb.add_format({
+        "bold": True, "font_color": "white", "bg_color": "#17365D",
+        "font_size": 16, "align": "center", "valign": "vcenter",
+    })
+    fmt_subtitle = wb.add_format({
+        "italic": True, "font_color": "#44546A", "bg_color": "#EAF2F8",
+        "text_wrap": True, "valign": "vcenter",
+    })
+    fmt_section = wb.add_format({
+        "bold": True, "font_color": "#17365D", "bg_color": "#D9EAF7",
+        "border": 1,
+    })
+    fmt_header = wb.add_format({
+        "bold": True, "font_color": "white", "bg_color": "#1F4E78",
+        "border": 1, "text_wrap": True, "align": "center", "valign": "vcenter",
+    })
+    fmt_money = wb.add_format({"num_format": '₦#,##0.00;[Red](₦#,##0.00);-', "border": 1})
+    fmt_number = wb.add_format({"num_format": '#,##0', "border": 1})
+    fmt_percent = wb.add_format({"num_format": '0.0%', "border": 1})
+    fmt_text = wb.add_format({"border": 1, "text_wrap": True, "valign": "top"})
+    fmt_center = wb.add_format({"border": 1, "align": "center", "valign": "vcenter"})
+    fmt_note = wb.add_format({
+        "font_color": "#7F6000", "bg_color": "#FFF2CC",
+        "text_wrap": True, "valign": "top", "border": 1,
+    })
+    fmt_kpi_label = wb.add_format({
+        "bold": True, "font_color": "#17365D", "bg_color": "#D9EAF7",
+        "align": "center", "valign": "vcenter", "border": 1,
+    })
+    fmt_kpi_money = wb.add_format({
+        "bold": True, "font_size": 14, "font_color": "#17365D",
+        "bg_color": "#EAF2F8", "align": "center", "valign": "vcenter",
+        "num_format": '₦#,##0.00', "border": 1,
+    })
+    fmt_kpi_count = wb.add_format({
+        "bold": True, "font_size": 14, "font_color": "#17365D",
+        "bg_color": "#EAF2F8", "align": "center", "valign": "vcenter",
+        "num_format": '#,##0', "border": 1,
+    })
+    fmt_critical = wb.add_format({"bg_color": "#F4CCCC", "font_color": "#9C0006", "bold": True, "border": 1})
+    fmt_high = wb.add_format({"bg_color": "#FCE5CD", "font_color": "#C65911", "bold": True, "border": 1})
+    fmt_significant = wb.add_format({"bg_color": "#FFF2CC", "font_color": "#7F6000", "bold": True, "border": 1})
+    fmt_low = wb.add_format({"bg_color": "#E2F0D9", "font_color": "#375623", "border": 1})
+
+    recovery = option2_detail[option2_detail["Direction"] == "Customer Owes Us"].copy()
+    token_due = option2_detail[option2_detail["Direction"] == "We Owe Customer Token"].copy()
+
+    recovery = recovery.sort_values(["Rank", "Customer Name"])
+    token_due = token_due.sort_values(["Rank", "Customer Name"])
+
+    recovery_total = pd.to_numeric(recovery["Outstanding Amount"], errors="coerce").fillna(0).sum()
+    token_due_total = pd.to_numeric(token_due["Outstanding Amount"], errors="coerce").fillna(0).sum()
+    net_position = recovery_total - token_due_total
+
+    rec_summary = _option2_category_summary(option2_detail, "Customer Owes Us")
+    due_summary = _option2_category_summary(option2_detail, "We Owe Customer Token")
+
+    # -------------------------
+    # Title
+    # -------------------------
+    ws.merge_range("A1:P1", "MANAGEMENT SUMMARY — OPTION 2 CUSTOMER TOKEN RECONCILIATION", fmt_title)
+    ws.set_row(0, 28)
+    ws.merge_range(
+        "A2:P2",
+        "Exposure category = each customer's individual share of the relevant total outstanding. "
+        "Purchase frequency is shown separately and does not change financial materiality.",
+        fmt_subtitle,
+    )
+
+    # -------------------------
+    # KPI cards
+    # -------------------------
+    kpis = [
+        ("A4:C4", "A5:C6", "CUSTOMERS OWING US", len(recovery), False),
+        ("D4:F4", "D5:F6", "RECOVERY OUTSTANDING", recovery_total, True),
+        ("G4:I4", "G5:I6", "CUSTOMERS WE OWE TOKEN", len(token_due), False),
+        ("J4:L4", "J5:L6", "TOKEN VALUE DUE", token_due_total, True),
+        ("M4:P4", "M5:P6", "NET RECEIVABLE POSITION", net_position, True),
+    ]
+    for label_range, value_range, label, value, is_money in kpis:
+        ws.merge_range(label_range, label, fmt_kpi_label)
+        ws.merge_range(value_range, value, fmt_kpi_money if is_money else fmt_kpi_count)
+
+    # -------------------------
+    # Rating guides
+    # -------------------------
+    ws.merge_range("A8:P8", "OPTION 2 EXPOSURE & PURCHASE-FREQUENCY GUIDE", fmt_section)
+
+    exposure_guide = [
+        ["Exposure Category", "Individual Share of Total", "Meaning", "Management Use"],
+        ["Critical", ">=10%", "One customer individually represents at least 10% of total exposure", "Executive attention / immediate validation"],
+        ["High Materiality", "2% to <10%", "Customer is individually material to the total exposure", "Prioritise for action"],
+        ["Significant", "0.5% to <2%", "Meaningful individual exposure", "Monitor and resolve systematically"],
+        ["Low Materiality", "<0.5%", "Small individual contribution to total exposure", "Routine resolution / batch handling"],
+    ]
+    for c, val in enumerate(exposure_guide[0]):
+        ws.write(8, c, val, fmt_header)
+    for r, row in enumerate(exposure_guide[1:], start=9):
+        for c, val in enumerate(row):
+            ws.write(r, c, val, fmt_text)
+
+    frequency_guide = [
+        ["Purchase Frequency", "VPS Purchases", "Interpretation", "Why It Matters"],
+        ["Very Frequent", "13+", "Approx. top activity tier", "Active / high-touch customer"],
+        ["Frequent", "7-12", "Upper activity range", "Regular commercial relationship"],
+        ["Regular", "4-6", "Mid-range activity", "Established moderate activity"],
+        ["Occasional", "1-3", "Lower purchase-frequency range", "Less frequent customer"],
+    ]
+    for c, val in enumerate(frequency_guide[0], start=7):
+        ws.write(8, c, val, fmt_header)
+    for r, row in enumerate(frequency_guide[1:], start=9):
+        for c, val in enumerate(row, start=7):
+            ws.write(r, c, val, fmt_text)
+
+    ws.merge_range(
+        "M9:P13",
+        "How to read the report:\n\n"
+        "Exposure Category = how much the customer matters financially.\n\n"
+        "Purchase Frequency = how active the customer is.\n\n"
+        "The two ratings are intentionally separate.",
+        fmt_note,
+    )
+
+    # -------------------------
+    # Distribution summaries
+    # -------------------------
+    ws.merge_range("A16:G16", "CUSTOMERS OWING US — EXPOSURE DISTRIBUTION", fmt_section)
+    ws.merge_range("I16:P16", "CUSTOMERS WE OWE TOKEN — EXPOSURE DISTRIBUTION", fmt_section)
+
+    rec_headers = ["Exposure Category", "Customers", "Outstanding (₦)", "% of Total"]
+    due_headers = ["Exposure Category", "Customers", "Token Due (₦)", "% of Total"]
+    for c, h in enumerate(rec_headers):
+        ws.write(16, c, h, fmt_header)
+    for c, h in enumerate(due_headers, start=8):
+        ws.write(16, c, h, fmt_header)
+
+    for i, row in rec_summary.iterrows():
+        rr = 17 + i
+        ws.write(rr, 0, row["Exposure Category"], fmt_text)
+        ws.write_number(rr, 1, int(row["Customers"]), fmt_number)
+        ws.write_number(rr, 2, float(row["Outstanding Amount"]), fmt_money)
+        ws.write_number(rr, 3, float(row["% of Direction Total"]), fmt_percent)
+
+    for i, row in due_summary.iterrows():
+        rr = 17 + i
+        ws.write(rr, 8, row["Exposure Category"], fmt_text)
+        ws.write_number(rr, 9, int(row["Customers"]), fmt_number)
+        ws.write_number(rr, 10, float(row["Outstanding Amount"]), fmt_money)
+        ws.write_number(rr, 11, float(row["% of Direction Total"]), fmt_percent)
+
+    # -------------------------
+    # Top 15 tables
+    # -------------------------
+    ws.merge_range("A23:H23", "TOP CUSTOMERS OWING US — RANKED BY OUTSTANDING", fmt_section)
+    ws.merge_range("J23:P23", "TOP CUSTOMERS WE OWE TOKEN — RANKED BY TOKEN DUE", fmt_section)
+
+    top_headers = ["Rank", "Customer", "VPS Purchases", "Frequency", "Outstanding (₦)", "% of Total", "Exposure Category", "KYC Status"]
+    for c, h in enumerate(top_headers):
+        ws.write(23, c, h, fmt_header)
+
+    due_top_headers = ["Rank", "Customer", "VPS Purchases", "Frequency", "Token Due (₦)", "% of Total", "Exposure Category"]
+    for c, h in enumerate(due_top_headers, start=9):
+        ws.write(23, c, h, fmt_header)
+
+    def category_format(category):
+        if category == "Critical":
+            return fmt_critical
+        if category == "High Materiality":
+            return fmt_high
+        if category == "Significant":
+            return fmt_significant
+        return fmt_low
+
+    for i, (_, r) in enumerate(recovery.head(15).iterrows(), start=24):
+        ws.write_number(i, 0, int(r["Rank"]), fmt_number)
+        ws.write(i, 1, clean_id(r["Customer Name"]), fmt_text)
+        ws.write_number(i, 2, int(r["Total VPS Payment Count"]), fmt_number)
+        ws.write(i, 3, r["Purchase Frequency Rating"], fmt_text)
+        ws.write_number(i, 4, float(r["Outstanding Amount"]), fmt_money)
+        ws.write_number(i, 5, float(r["Individual Share of Total"]), fmt_percent)
+        ws.write(i, 6, r["Exposure Category"], category_format(r["Exposure Category"]))
+        ws.write(i, 7, r["KYC Status"], fmt_text)
+
+    for i, (_, r) in enumerate(token_due.head(15).iterrows(), start=24):
+        ws.write_number(i, 9, int(r["Rank"]), fmt_number)
+        ws.write(i, 10, clean_id(r["Customer Name"]), fmt_text)
+        ws.write_number(i, 11, int(r["Total VPS Payment Count"]), fmt_number)
+        ws.write(i, 12, r["Purchase Frequency Rating"], fmt_text)
+        ws.write_number(i, 13, float(r["Outstanding Amount"]), fmt_money)
+        ws.write_number(i, 14, float(r["Individual Share of Total"]), fmt_percent)
+        ws.write(i, 15, r["Exposure Category"], category_format(r["Exposure Category"]))
+
+    # -------------------------
+    # Full supporting detail
+    # -------------------------
+    detail_start = 41  # Excel row 42
+    ws.merge_range(detail_start, 0, detail_start, 15, "FULL OPTION 2 CUSTOMER DETAIL", fmt_section)
+    detail_header_row = detail_start + 1
+
+    detail_cols = [
+        "Direction",
+        "Rank",
+        "Summary Customer Key",
+        "Customer Name",
+        "Customer Classification",
+        "KYC Status",
+        "Total VPS Payment Count",
+        "Purchase Frequency Rating",
+        "VPS Paid / No Token Count",
+        "Token / No VPS Payment Count",
+        "Option2 Expected Token Value",
+        "Option2 Actual Macron Token",
+        "Outstanding Amount",
+        "Individual Share of Total",
+        "Exposure Category",
+        "Relevant Total Outstanding",
+    ]
+
+    for c, h in enumerate(detail_cols):
+        ws.write(detail_header_row, c, h, fmt_header)
+
+    full_detail = option2_detail.sort_values(["Direction", "Rank"]).reset_index(drop=True)
+    for ridx, r in full_detail.iterrows():
+        rr = detail_header_row + 1 + ridx
+        for cidx, col in enumerate(detail_cols):
+            value = r.get(col)
+            if pd.isna(value):
+                ws.write_blank(rr, cidx, None, fmt_text)
+            elif col in {"Option2 Expected Token Value", "Option2 Actual Macron Token", "Outstanding Amount", "Relevant Total Outstanding"}:
+                ws.write_number(rr, cidx, float(value), fmt_money)
+            elif col == "Individual Share of Total":
+                ws.write_number(rr, cidx, float(value), fmt_percent)
+            elif col in {"Rank", "Total VPS Payment Count", "VPS Paid / No Token Count", "Token / No VPS Payment Count"}:
+                ws.write_number(rr, cidx, int(value), fmt_number)
+            elif col == "Exposure Category":
+                ws.write(rr, cidx, value, category_format(value))
+            else:
+                ws.write(rr, cidx, clean_id(value), fmt_text)
+
+    # Filters only on the full supporting detail table.
+    if len(full_detail):
+        ws.autofilter(detail_header_row, 0, detail_header_row + len(full_detail), len(detail_cols) - 1)
+
+    # -------------------------
+    # Layout
+    # -------------------------
+    widths = [18, 9, 25, 30, 22, 24, 17, 18, 18, 18, 21, 21, 20, 14, 20, 22]
+    for c, width in enumerate(widths):
+        ws.set_column(c, c, width)
+
+    ws.freeze_panes(detail_header_row + 1, 0)
+    ws.hide_gridlines(2)
+
+
 def build_management(final_recon, kyc, pay, control):
     paid_no_token = final_recon[(final_recon["VPS Present?"] == "YES") & (final_recon["Macron Present?"] == "NO")]
     token_no_vps = final_recon[(final_recon["Macron Present?"] == "YES") & (final_recon["VPS Present?"] == "NO")]
@@ -1078,6 +1567,7 @@ def build_column_guide(sheet_pairs):
         "13 Token No VPS": "Macron token rows with no VPS payment.",
         "14 Missing KYC": "Full-reconciliation rows where no KYC could be attached.",
         "15 Source Coverage": "Checks that every Bank credit, VPS, cleaned Paymeter and Macron row is represented exactly once.",
+        "16 Option 2 Management": "Management report separating customers owing us from customers we owe token. Financial materiality is based on each customer's individual share of the relevant total outstanding; purchase frequency is rated separately.",
     }
     rows = []
     for sheet, df in sheet_pairs:
@@ -1100,6 +1590,24 @@ def build_column_guide(sheet_pairs):
                 calc = "Primary: VPS settlement_ref = Paymeter RRN. Fallback: same KYC + matching gross/token amount + date."
             elif col == "FINAL_Reconciliation_Status":
                 calc = "Derived from Bank/VPS/Paymeter/Macron presence, KYC alignment and amount checks."
+            elif col == "Option2 Expected Token Value":
+                calc = "Total VPS Customer Amount Paid - (Total VPS Payment Count x N100)."
+                meaning = "Correct token value due to the customer after the N100 charge on each VPS payment."
+            elif col == "Option2 Actual Macron Token":
+                calc = "Total Macron Token Amount from Customer Summary."
+                meaning = "Actual aggregate token value issued by Macron."
+            elif col == "Outstanding Amount":
+                calc = "Absolute directional difference between actual Macron token and recalculated expected token."
+                meaning = "Amount recoverable from customer or token value still due to customer."
+            elif col == "Individual Share of Total":
+                calc = "Customer Outstanding Amount divided by total outstanding for that Direction."
+                meaning = "Option 2 financial materiality measure."
+            elif col == "Exposure Category":
+                calc = "Critical >=10%; High Materiality 2%-<10%; Significant 0.5%-<2%; Low Materiality <0.5%."
+                meaning = "Option 2 exposure category based on individual share of relevant total outstanding."
+            elif col == "Purchase Frequency Rating":
+                calc = "Very Frequent 13+; Frequent 7-12; Regular 4-6; Occasional 1-3; No VPS History 0."
+                meaning = "Customer activity rating, kept separate from financial materiality."
             elif col.startswith("Difference"):
                 calc = "Arithmetic difference between the two values named in the header. Zero means exact alignment."
             elif col.startswith("Total "):
@@ -1139,7 +1647,10 @@ def make_excel(result):
         ("14 Missing KYC", result["missing_kyc"]),
         ("15 Source Coverage", result["source_coverage"]),
     ]
-    guide = build_column_guide(sheets)
+    # Include the Option 2 detail columns in the Column Guide, while the
+    # actual Option 2 tab itself is written as a custom management sheet.
+    guide_pairs = sheets + [("16 Option 2 Management", result["option2_management"])]
+    guide = build_column_guide(guide_pairs)
     sheets.insert(0, ("00 Column Guide", guide))
 
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="dd-mmm-yyyy hh:mm:ss", engine_kwargs={"options": {"strings_to_urls": False}}) as writer:
@@ -1174,6 +1685,10 @@ def make_excel(result):
                     ws.conditional_format(1, j, len(safe), j, {"type": "text", "criteria": "containing", "value": "MATCH", "format": fmt_good})
                     ws.conditional_format(1, j, len(safe), j, {"type": "text", "criteria": "containing", "value": "NO ", "format": fmt_bad})
                     ws.conditional_format(1, j, len(safe), j, {"type": "text", "criteria": "containing", "value": "DIFFERENCE", "format": fmt_bad})
+
+        # Custom one-tab Option 2 management report.
+        _write_option2_management_sheet(writer, result["option2_management"])
+
     output.seek(0)
     return output
 
@@ -1221,6 +1736,9 @@ def run_reconciliation(bank_file, vps_file, paymeter_file, macron_file, date_tol
     source_coverage = build_source_coverage(final_recon, bank, vps, pay, mac)
     management = build_management(final_recon, kyc, pay, summary_control)
 
+    progress_call(progress, 96, "Building Option 2 management exposure report...")
+    option2_management = build_option2_management(customer_summary)
+
     progress_call(progress, 100, "Reconciliation calculations complete.")
     return {
         "pay_cleaned": pay,
@@ -1238,6 +1756,7 @@ def run_reconciliation(bank_file, vps_file, paymeter_file, macron_file, date_tol
         "token_no_vps": token_no_vps,
         "missing_kyc": missing_kyc,
         "source_coverage": source_coverage,
+        "option2_management": option2_management,
     }
 
 
@@ -1297,18 +1816,66 @@ def main():
 
         st.subheader("Reconciliation Summary")
         st.dataframe(result["management"], use_container_width=True, hide_index=True)
-        tabs = st.tabs(["Full Reconciliation", "KYC", "VPS vs Macron", "Customer Summary", "Summary Control", "Source Coverage"])
-        with tabs[0]: st.dataframe(result["final_recon"].head(1500), use_container_width=True, hide_index=True)
-        with tabs[1]: st.dataframe(result["kyc"].head(1500), use_container_width=True, hide_index=True)
-        with tabs[2]: st.dataframe(result["vps_macron"].head(1500), use_container_width=True, hide_index=True)
-        with tabs[3]: st.dataframe(result["customer_summary"].head(1500), use_container_width=True, hide_index=True)
-        with tabs[4]: st.dataframe(result["summary_control"], use_container_width=True, hide_index=True)
-        with tabs[5]: st.dataframe(result["source_coverage"], use_container_width=True, hide_index=True)
+        tabs = st.tabs([
+            "Full Reconciliation",
+            "KYC",
+            "VPS vs Macron",
+            "Customer Summary",
+            "Summary Control",
+            "Source Coverage",
+            "Option 2 Management",
+        ])
+        with tabs[0]:
+            st.dataframe(result["final_recon"].head(1500), use_container_width=True, hide_index=True)
+        with tabs[1]:
+            st.dataframe(result["kyc"].head(1500), use_container_width=True, hide_index=True)
+        with tabs[2]:
+            st.dataframe(result["vps_macron"].head(1500), use_container_width=True, hide_index=True)
+        with tabs[3]:
+            st.dataframe(result["customer_summary"].head(1500), use_container_width=True, hide_index=True)
+        with tabs[4]:
+            st.dataframe(result["summary_control"], use_container_width=True, hide_index=True)
+        with tabs[5]:
+            st.dataframe(result["source_coverage"], use_container_width=True, hide_index=True)
+        with tabs[6]:
+            opt2 = result["option2_management"].copy()
+            rec = opt2[opt2["Direction"] == "Customer Owes Us"]
+            due = opt2[opt2["Direction"] == "We Owe Customer Token"]
+
+            rec_total = pd.to_numeric(rec["Outstanding Amount"], errors="coerce").fillna(0).sum()
+            due_total = pd.to_numeric(due["Outstanding Amount"], errors="coerce").fillna(0).sum()
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Customers owing us", len(rec))
+            c2.metric("Recovery outstanding", f"₦{rec_total:,.2f}")
+            c3.metric("Customers we owe token", len(due))
+            c4.metric("Token value due", f"₦{due_total:,.2f}")
+            c5.metric("Net receivable", f"₦{(rec_total - due_total):,.2f}")
+
+            st.caption(
+                "Exposure Category: Critical >=10%; High Materiality 2%-<10%; "
+                "Significant 0.5%-<2%; Low Materiality <0.5%. "
+                "Purchase Frequency is rated separately."
+            )
+
+            st.markdown("#### Customers owing us")
+            st.dataframe(
+                rec.sort_values("Rank").head(150),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.markdown("#### Customers we owe token")
+            st.dataframe(
+                due.sort_values("Rank").head(150),
+                use_container_width=True,
+                hide_index=True,
+            )
 
         st.download_button(
             "⬇️ DOWNLOAD RECONCILIATION WORKBOOK",
             data=excel,
-            file_name="Merge_First_KYC_Reconciliation_V9.xlsx",
+            file_name="Merge_First_KYC_Reconciliation_V10.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=True,
